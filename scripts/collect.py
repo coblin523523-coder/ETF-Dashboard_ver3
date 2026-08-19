@@ -19,10 +19,13 @@ import time
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
+import numpy as np
 import pandas as pd
 from pykrx import stock
+from pykrx.website.krx.etx.core import PDF
 
 from config import DATA_DIR, ETFS, PDF_COLUMNS
+from isin import ticker_to_isin
 
 KST = ZoneInfo("Asia/Seoul")
 
@@ -50,23 +53,52 @@ def business_days_back(end: str, count: int) -> list[str]:
     return days
 
 
+RAW_COLUMNS = [
+    "COMPST_ISU_CD", "COMPST_ISU_NM", "COMPST_ISU_CU1_SHRS",
+    "VALU_AMT", "COMPST_AMT", "COMPST_RTO",
+]
+
+
 def fetch_pdf(date: str, ticker: str) -> pd.DataFrame | None:
-    """특정일·특정 ETF의 구성종목을 조회한다. 실패하거나 비면 None."""
+    """특정일·특정 ETF의 구성종목을 조회한다. 실패하거나 비면 None.
+
+    pykrx 의 get_etf_portfolio_deposit_file() 은 내부에서 KRX 전종목 목록을
+    받아 티커를 ISIN 으로 바꾸는데, 그 사전 조회가 막히면 ('_get_tickers' 실패)
+    PDF 를 시도조차 못 한다. ISIN 은 규칙으로 계산할 수 있으므로 직접 구해
+    그 단계를 건너뛰고, 실패했을 때만 pykrx 기본 경로로 되돌아간다.
+    """
     try:
-        df = stock.get_etf_portfolio_deposit_file(date, ticker)
-    except Exception as exc:  # 네트워크·파싱 오류 모두 여기로
-        print(f"    [!] {ticker} {date} 조회 실패: {type(exc).__name__}: {exc}")
-        return None
+        raw = PDF().fetch(date, ticker_to_isin(ticker))
+    except Exception as exc:
+        print(f"    [!] {ticker} {date} 직접 조회 실패: {type(exc).__name__}: {exc}")
+        raw = None
 
-    if df is None or df.empty:
-        return None
-
-    df = df.reset_index()
-    for col in PDF_COLUMNS:
-        if col not in df.columns:
-            print(f"    [!] {ticker} {date} 예상 컬럼 없음: {col}")
+    if raw is None or raw.empty:
+        # 예비 경로: pykrx 기본 API
+        try:
+            df = stock.get_etf_portfolio_deposit_file(date, ticker)
+        except Exception:
             return None
-    return df[PDF_COLUMNS]
+        if df is None or df.empty:
+            return None
+        df = df.reset_index()
+        return df[PDF_COLUMNS] if all(c in df.columns for c in PDF_COLUMNS) else None
+
+    if not all(c in raw.columns for c in RAW_COLUMNS):
+        print(f"    [!] {ticker} {date} 예상 컬럼 없음: {list(raw.columns)[:6]}")
+        return None
+
+    df = raw[RAW_COLUMNS].copy()
+    df.columns = PDF_COLUMNS
+    # 서버가 티커 자리에 ISIN 과 축약형을 섞어 준다
+    df["티커"] = df["티커"].apply(lambda x: x[3:9] if len(str(x)) > 6 else x)
+    df = df.replace(",", "", regex=True).replace(r"^\s*-\s*$", "0", regex=True)
+    for col, kind in (("계약수", np.float64), ("금액", np.int64),
+                      ("시가총액", np.int64), ("비중", np.float64)):
+        df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0).astype(kind)
+
+    df = df[(df[["계약수", "금액", "시가총액", "비중"]] != 0).any(axis=1)]
+    return df if not df.empty else None
 
 
 def fetch_quote(date: str, ticker: str) -> dict:
