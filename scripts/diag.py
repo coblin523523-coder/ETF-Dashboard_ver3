@@ -1,17 +1,17 @@
-"""KRX가 왜 응답하지 않는지 한 번에 판별하는 진단 스크립트.
+"""KRX 접근 상태를 한 번에 판별하는 진단 스크립트.
 
-    python diag.py
+    python scripts/diag.py
 
-순서대로 확인한다.
-  1. data.krx.co.kr 에 HTTP로 닿기는 하는가 (상태코드·응답 앞부분)
-  2. pykrx 가 쓰는 JSON 엔드포인트가 JSON을 주는가
-  3. ISIN 사전 조회를 건너뛰고 PDF를 직접 부르면 되는가
-  4. KRX 로그인 자격이 있으면 결과가 달라지는가
+KRX 정보데이터시스템은 2025년 12월부터 회원제(KRX Data Marketplace)로 바뀌어
+비로그인 요청에는 HTTP 400 + 본문 "LOGOUT" 을 돌려준다.
+따라서 확인해야 할 것은 두 가지다.
+
+  1. 비로그인 상태에서 정확히 어떤 거절을 받는가
+  2. KRX_ID / KRX_PW 로 로그인하면 실제로 데이터가 내려오는가
 """
 
 from __future__ import annotations
 
-import json
 import os
 import sys
 
@@ -29,27 +29,48 @@ HEADERS = {
     "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
 }
 
-TICKERS = ["456600", "471040", "466950"]
+TICKERS = [
+    ("456600", "TIMEFOLIO 글로벌AI인공지능액티브"),
+    ("471040", "KoAct 글로벌AI&로봇액티브"),
+    ("466950", "TIGER 글로벌AI액티브"),
+]
+PROBE_DATE = "20260814"
 
 
-def show_response(resp: requests.Response, label: str) -> dict | None:
+def describe(resp: requests.Response) -> dict | None:
+    body = (resp.text or "").strip()
     print(f"    상태코드 : {resp.status_code}")
-    print(f"    컨텐츠타입: {resp.headers.get('Content-Type', '(없음)')}")
-    body = resp.text or ""
     print(f"    응답길이 : {len(body)}자")
-    preview = body[:300].replace("\n", " ").replace("\r", "")
-    print(f"    응답앞부분: {preview if preview else '(빈 응답)'}")
+    print(f"    응답앞부분: {body[:200] if body else '(빈 응답)'}")
+    if body.upper() == "LOGOUT":
+        print("    -> 로그인 세션이 없다는 거절입니다.")
+        return None
     try:
-        data = resp.json()
-        print(f"    -> JSON 파싱 성공. 최상위 키: {list(data.keys())[:8]}")
-        return data
+        return resp.json()
     except Exception as exc:
         print(f"    -> JSON 파싱 실패: {exc}")
         return None
 
 
-def post(payload: dict, session: requests.Session) -> requests.Response:
-    return session.post(BASE, data=payload, headers=HEADERS, timeout=20)
+def report_rows(data: dict, label: str) -> bool:
+    rows = data.get("output") or []
+    if not rows:
+        print("    JSON은 왔지만 output 이 비었습니다.")
+        return False
+
+    print(f"    ***** 구성종목 {len(rows)}개 수신 성공 *****")
+    weights = []
+    for row in rows[:5]:
+        rto = row.get("COMPST_RTO", "0")
+        weights.append(rto)
+        print(f"      {str(row.get('COMPST_ISU_NM', '?'))[:32]:<32} 비중 {rto}")
+
+    try:
+        total = sum(float(str(r.get("COMPST_RTO", "0")).replace(",", "") or 0) for r in rows)
+    except Exception:
+        total = 0.0
+    print(f"    비중 합계 = {total:.2f}%  ->  {'정상' if total > 0 else '0! 금액으로 환산 필요'}")
+    return True
 
 
 def main() -> None:
@@ -57,55 +78,79 @@ def main() -> None:
     print(" KRX 접근 진단")
     print("=" * 66)
 
-    session = requests.Session()
-
-    # ── 1. 최소 요청: 도메인에 닿는가 ──────────────────────────
-    print("\n[1] data.krx.co.kr 도달 확인 (ETF 전종목 시세)")
+    # ── 1. 비로그인 상태 확인 ──────────────────────────────────
+    print("\n[1] 비로그인 상태로 요청")
+    plain = requests.Session()
     try:
-        r = post({"bld": "dbms/MDC/STAT/standard/MDCSTAT04301",
-                  "trdDd": "20260814", "share": "1", "money": "1"}, session)
-        show_response(r, "전종목시세")
+        r = plain.post(BASE, data={"bld": "dbms/MDC/STAT/standard/MDCSTAT05001",
+                                   "trdDd": PROBE_DATE,
+                                   "isuCd": ticker_to_isin("456600")},
+                       headers=HEADERS, timeout=20)
+        describe(r)
     except Exception as exc:
         print(f"    요청 자체 실패: {type(exc).__name__}: {exc}")
-        print("\n    네트워크 레벨에서 차단되었습니다. 여기서 끝입니다.")
+        print("\n    네트워크 레벨 차단입니다. 계정으로도 해결되지 않습니다.")
         return
 
-    # ── 2. PDF 엔드포인트를 ISIN으로 직접 호출 ────────────────
-    print("\n[2] PDF 엔드포인트 직접 호출 (ISIN 사전조회 건너뜀)")
-    for ticker in TICKERS:
-        code = ticker_to_isin(ticker)
-        print(f"\n  ── {ticker} (ISIN {code})")
+    # ── 2. 로그인 ─────────────────────────────────────────────
+    print("\n[2] KRX 로그인")
+    if not (os.getenv("KRX_ID") and os.getenv("KRX_PW")):
+        print("    KRX_ID / KRX_PW 가 설정되어 있지 않습니다.")
+        print("    -> data.krx.co.kr 에서 회원가입 후 저장소 Secrets 에 등록하세요.")
+        print("\n" + "=" * 66)
+        print(" 결론: KRX가 회원제로 바뀌어 로그인 없이는 불가합니다.")
+        print("=" * 66)
+        return
+
+    try:
+        from pykrx.website.comm.auth import build_krx_session
+        krxs = build_krx_session()
+    except Exception as exc:
+        print(f"    로그인 중 오류: {type(exc).__name__}: {exc}")
+        krxs = None
+
+    if not krxs:
+        print("\n    로그인 실패. 아이디/비밀번호를 확인하세요.")
+        print("    (KRX는 일정 기간마다 비밀번호 변경을 강제하기도 합니다)")
+        return
+    print("    로그인 성공.")
+
+    # ── 3. 로그인 세션으로 PDF 조회 ───────────────────────────
+    print(f"\n[3] 로그인 세션으로 PDF 조회 (기준일 {PROBE_DATE})")
+    ok_count = 0
+    for ticker, label in TICKERS:
+        print(f"\n  ── {label} ({ticker} / {ticker_to_isin(ticker)})")
         try:
-            r = post({"bld": "dbms/MDC/STAT/standard/MDCSTAT05001",
-                      "trdDd": "20260814", "isuCd": code}, session)
-            data = show_response(r, ticker)
-            if data and data.get("output"):
-                rows = data["output"]
-                print(f"    ***** 구성종목 {len(rows)}개 수신 성공 *****")
-                for row in rows[:3]:
-                    print(f"      {row.get('COMPST_ISU_NM', '?')[:30]:<30} "
-                          f"비중 {row.get('COMPST_RTO', '?')}")
-            elif data:
-                print("    JSON은 왔지만 output이 비었습니다.")
+            r = krxs.session.post(
+                BASE,
+                data={"bld": "dbms/MDC/STAT/standard/MDCSTAT05001",
+                      "trdDd": PROBE_DATE, "isuCd": ticker_to_isin(ticker)},
+                headers=HEADERS, timeout=20,
+            )
+            data = describe(r)
+            if data and report_rows(data, label):
+                ok_count += 1
         except Exception as exc:
             print(f"    실패: {type(exc).__name__}: {exc}")
 
-    # ── 3. 로그인 자격 여부 ───────────────────────────────────
-    print("\n[3] KRX 로그인 자격")
-    if os.getenv("KRX_ID") and os.getenv("KRX_PW"):
-        print("    KRX_ID / KRX_PW 가 설정되어 있습니다. pykrx 로그인 경로를 시도합니다.")
+    # ── 4. 과거 소급 ──────────────────────────────────────────
+    print("\n[4] 과거 날짜 소급 조회 (456600)")
+    for probe in ("20260601", "20260401", "20260102"):
         try:
-            from pykrx.website.comm.auth import build_krx_session
-            s = build_krx_session()
-            print(f"    로그인 세션: {'성공' if s else '실패'}")
-        except Exception as exc:
-            print(f"    로그인 시도 중 오류: {type(exc).__name__}: {exc}")
-    else:
-        print("    설정되어 있지 않습니다. (Secrets 에 KRX_ID / KRX_PW 등록 시 여기서 재확인됩니다)")
+            r = krxs.session.post(
+                BASE,
+                data={"bld": "dbms/MDC/STAT/standard/MDCSTAT05001",
+                      "trdDd": probe, "isuCd": ticker_to_isin("456600")},
+                headers=HEADERS, timeout=20,
+            )
+            data = r.json() if r.status_code == 200 else None
+            n = len(data.get("output") or []) if data else 0
+            print(f"    {probe} : {f'가능 - {n}종목' if n else '불가'}")
+        except Exception:
+            print(f"    {probe} : 불가")
 
     print("\n" + "=" * 66)
-    print(" [2]번에서 '구성종목 N개 수신 성공' 이 보이면 pykrx로 갈 수 있습니다.")
-    print(" 전부 실패했다면 KRX가 이 서버(해외 IP)를 막고 있는 것입니다.")
+    print(f" 결론: 3종 중 {ok_count}종 수신 성공")
     print("=" * 66)
 
 
